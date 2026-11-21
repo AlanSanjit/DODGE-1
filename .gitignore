@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+pairs/
+calib.json
+rectify_maps.npz

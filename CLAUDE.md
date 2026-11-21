@@ -147,9 +147,21 @@ the supervisor prints the PIDs.
 - Prefer small, testable changes; keep the message schema table in this file up to date.
 
 ## Current status (as of 2026-11-21)
-Done and tested with synthetic cameras: perception (CNN 99.5% on synthetic, depth error ~0.3 mm),
-control, supervisor, 3D simulator, calibration (recovered a 6.00 cm baseline as 5.99 cm), training.
-Results: 0 hits across ~20 encounters; crash, hang and stuck-valve recovery all verified.
+All files in the table exist and were tested on the LAPTOP only (Windows, Python 3.14, synthetic cameras).
+Nothing has run on the Pi/QNX yet, so there are no QNX timing numbers.
+- Perception: CNN int8 TFLite 99.7% on held-out synthetic patches (evaluated through the Pi code path);
+  stereo depth mean error ~2 mm over 9-60 cm (sub-mm laterally); ~3 ms/frame + 7 ms depth map; 30 fps.
+- Calibration self-test (`--synthetic 25`): recovered the 6.00 cm baseline as 6.01 cm, rms 0.37 px.
+- End-to-end (headless sim3d + supervisor + synthetic perception + CNN): 0 hits over 14 encounters;
+  perception crash (kill) -> restarted; control hang (process suspended) -> killed + restarted after 0.5 s;
+  stuck valve +z:A -> FDIR isolated +z:A, switched to B, later dodges clear. Mock ball (M): 5/5 clear.
+- Known limits: (1) propellant: each dodge + return costs ~0.17 kg, so 2 kg lasts ~12 encounters; press R
+  between demo runs (a stuck valve with an empty tank cannot be recovered: PROP_DEPLETED).
+  (2) with SPACE_SCALE 100 the tracked asteroid never gets closer than ~9.5 m to the slot (stereo minimum
+  range ~9 cm at DISP_MAX 170), so COLLISION_DIST 4 m is only reachable if the satellite moves toward it;
+  the encounter log therefore prints both the satellite distance and the asteroid-to-slot distance.
+  (3) FDIR cannot tell "+z stuck open" from "-z stuck closed" while -z fires; it blames the leak first and
+  the commanded valve if the same axis trips again. It never isolates a valve's last branch.
 
 ## Next work (phases from the PRD)
 0. QNX bring-up: both cameras visible as sensor units 3 and 4; write the **stereo capture bridge**:
