@@ -33,7 +33,7 @@ from direct.gui.OnscreenImage import OnscreenImage                  # noqa: E402
 from panda3d.core import (AmbientLight, DirectionalLight, Geom, GeomNode, GeomPoints,  # noqa: E402
                           GeomTriangles, GeomVertexData, GeomVertexFormat, GeomVertexWriter,
                           LineSegs, LMatrix3f, LPoint3f, LQuaternionf, NodePath, TextNode,
-                          Texture, TransparencyAttrib, Vec3, Vec4)
+                          Texture, TextureStage, TransparencyAttrib, Vec3, Vec4)
 
 AXES = "xyz"
 M_SCENE = np.array([[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])   # scene = (-z, y, x) of LVLH
@@ -209,8 +209,24 @@ class Sim3D(ShowBase):
         self.last_enc_text = "-"
         self.sat_trail = collections.deque(maxlen=900)
         self.ast_trail = collections.deque(maxlen=300)
-        self.view = 1
+        self.view = 4                # camera's-eye view by default (matches the real layout)
         self.running = True
+        self.ar = {"dodged": False, "ball_home": False, "home_since": None}
+        self.auto_resets = 0
+        self.rewind = False
+        self.rewind_last_seen = 0.0
+        self.ast_vis = None; self.ast_vis_t = None; self.ast_raw_t = 0.0
+        self.feed_rx = None
+        if config.SIM_FEED:
+            try:
+                fs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                fs.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+                fs.bind(("0.0.0.0", config.SIM_FEED_PORT))
+                fs.setblocking(False)
+                import live_view
+                self.feed_rx = live_view.PreviewReceiver(fs)
+            except OSError as exc:
+                print("[sim3d] camera feed disabled (port %d: %s)" % (config.SIM_FEED_PORT, exc), flush=True)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -222,7 +238,7 @@ class Sim3D(ShowBase):
         self._build_scene()
         self._build_hud()
         for key, fn in (("1", lambda: self.set_view(1)), ("2", lambda: self.set_view(2)),
-                        ("3", lambda: self.set_view(3)), ("m", self.toggle_mock), ("s", self.inject_stuck),
+                        ("3", lambda: self.set_view(3)), ("4", lambda: self.set_view(4)), ("c", self.toggle_feed), ("m", self.toggle_mock), ("s", self.inject_stuck),
                         ("f", self.drain_prop), ("r", self.reset_sim), ("escape", self.quit)):
             self.accept(key, fn)
         self.taskMgr.add(self._render_task, "render")
@@ -302,11 +318,20 @@ class Sim3D(ShowBase):
         self.target_np = self.render.attachNewNode(ls.create()); self.target_np.setLightOff()
         # grid on the orbit plane through the slot for depth cues
         ls = LineSegs(); ls.setThickness(1); ls.setColor(0.15, 0.2, 0.3, 1)
-        for k in range(-40, 41, 5):
-            ls.moveTo(k, -40, -3); ls.drawTo(k, 60, -3)
-        for k in range(-40, 61, 5):
+        g0 = int(-config.SAT_BOARD_Z * config.SPACE_SCALE) - 10               # behind the real camera
+        g1 = int((0.75 - config.SAT_BOARD_Z) * config.SPACE_SCALE) + 10       # beyond the ball's start
+        for k in range(-40, 41, 10):
+            ls.moveTo(k, g0, -3); ls.drawTo(k, g1, -3)
+        for k in range(g0 - g0 % 10, g1, 10):
             ls.moveTo(-40, k, -3); ls.drawTo(40, k, -3)
         grid = self.render.attachNewNode(ls.create()); grid.setLightOff()
+        self.cam_y = -config.SAT_BOARD_Z * config.SPACE_SCALE          # real camera position (scene Y)
+        cm = make_box("realcam", 2.0, 1.2, 1.4, (0.15, 0.15, 0.18, 1)); cm.reparentTo(self.render)
+        cm.setPos(0, self.cam_y, 0)
+        lens = make_box("lens", 0.8, 0.3, 0.8, (0.3, 0.6, 1.0, 1)); lens.reparentTo(cm); lens.setPos(0, 0.7, 0)
+        ls = LineSegs(); ls.setThickness(1.5); ls.setColor(0.3, 0.6, 1.0, 1)
+        ls.moveTo(0, self.cam_y, 0); ls.drawTo(0, (0.75 - config.SAT_BOARD_Z) * config.SPACE_SCALE, 0)  # ball path
+        axis = self.render.attachNewNode(ls.create()); axis.setLightOff()
         self.trail_np = None
         self.line_np = None
         self._trail_t = 0.0
@@ -325,7 +350,7 @@ class Sim3D(ShowBase):
         kw3 = dict(kw); kw3.update(fg=(1, 0.25, 0.2, 1), scale=0.06, align=TextNode.ACenter)
         self.banner = OnscreenText(text="", pos=(0, -0.62), parent=self.a2dTopCenter, **kw3)
         kw2 = dict(kw); kw2["fg"] = (0.6, 0.7, 0.8, 1); kw2["scale"] = 0.036
-        self.hud_help = OnscreenText(text="1 chase  2 side  3 onboard  M mock ball  S stuck valve +z:A  "
+        self.hud_help = OnscreenText(text="1 chase  2 top  3 onboard  4 camera  M mock ball  S stuck valve +z:A  "
                                           "F drain prop  R reset  ESC quit",
                                      pos=(0.04, 0.05), parent=self.a2dBottomLeft, **kw2)
         self.lut = _lut()
@@ -335,12 +360,68 @@ class Sim3D(ShowBase):
         self.dtex.setRamImage(bytes(self.TEX_W * self.TEX_H * 3))
         self.dimg = OnscreenImage(image=self.dtex, pos=(-0.36, 0, 0.33), scale=(0.32, 1, 0.24),
                                   parent=self.a2dBottomRight)
-        OnscreenText(text="Pi stereo disparity", pos=(-0.66, 0.6), parent=self.a2dBottomRight,
-                     **dict(kw2, mayChange=False))
+        self.dlabel = OnscreenText(text="Pi stereo disparity", pos=(-0.66, 0.6), parent=self.a2dBottomRight,
+                                   **dict(kw2, mayChange=False))
+        # live camera feed from the Pi (perception's annotated preview: CNN boxes, depth, reason)
+        self.FEED_TEX = 512
+        self.ftex = Texture("feed")
+        self.ftex.setup2dTexture(self.FEED_TEX, self.FEED_TEX, Texture.T_unsigned_byte, Texture.F_rgb)
+        self.ftex.setRamImage(bytes(self.FEED_TEX * self.FEED_TEX * 3))
+        self.fimg = OnscreenImage(image=self.ftex, pos=(-0.47, 0, 0.55), scale=(0.44, 1, 0.462),
+                                  parent=self.a2dBottomRight)
+        self.fimg.hide()
+        self.show_feed = True
+        self.feed_t = None
 
     # ------------------------------------------------------------------ user actions
     def set_view(self, n):
         self.view = n
+
+    def toggle_feed(self):
+        self.show_feed = not self.show_feed
+
+    def _update_feed(self, now):
+        """Poll the Pi's camera feed and show it (bottom right) instead of the stereo disparity inset."""
+        if self.feed_rx is None:
+            return
+        got = self.feed_rx.poll()
+        if got is not None:
+            import live_view
+            img, meta = got
+            frame = live_view.render(img, meta, 400, False, 0.0)          # BGR, with CNN overlays
+            h, w = frame.shape[:2]
+            if h > self.FEED_TEX or w > self.FEED_TEX:
+                s = min(self.FEED_TEX / float(h), self.FEED_TEX / float(w))
+                import cv2
+                frame = cv2.resize(frame, (int(w * s), int(h * s)))
+                h, w = frame.shape[:2]
+            buf = np.zeros((self.FEED_TEX, self.FEED_TEX, 3), np.uint8)
+            buf[:h, :w] = frame[::-1]                                     # Panda: bottom row first
+            self.ftex.setRamImage(buf.tobytes())
+            self.fimg.setTexScale(TextureStage.getDefault(), w / float(self.FEED_TEX), h / float(self.FEED_TEX))
+            self.fimg.setScale(0.44, 1, 0.44 * h / float(w))
+            self.feed_t = now
+        live = self.show_feed and self.feed_t is not None and now - self.feed_t < 3.0
+        if live:
+            self.fimg.show(); self.dimg.hide(); self.dlabel.hide()
+        else:
+            self.fimg.hide(); self.dimg.show(); self.dlabel.show()
+
+    def _smooth_asteroid(self, ap, now):
+        """Display only: low-pass the drawn asteroid (camera depth noise x100 = visible jitter) and keep it
+        through short detection dropouts. Control and collision counting use the raw track."""
+        dt = max(now - self.ast_vis_t, 0.0) if self.ast_vis_t is not None else 0.0
+        self.ast_vis_t = now
+        if ap is not None:
+            self.ast_raw_t = now
+            if self.ast_vis is None or float(np.linalg.norm(ap - self.ast_vis)) > config.AST_SNAP_M:
+                self.ast_vis = np.array(ap, float)
+            else:
+                a = 1.0 - math.exp(-dt / max(config.AST_SMOOTH_S, 1e-3))
+                self.ast_vis = self.ast_vis + a * (ap - self.ast_vis)
+        elif self.ast_vis is not None and (self.rewind or now - self.ast_raw_t > config.AST_HOLD_S):
+            self.ast_vis = None
+        return self.ast_vis
 
     def toggle_mock(self):
         with self.lock:
@@ -361,12 +442,66 @@ class Sim3D(ShowBase):
 
     def reset_sim(self):
         with self.lock:
-            self.phys.reset()
-            self.reset_id += 1
-            self.isolated = []
-            self.branch = {v: "A" for v in config.VALVES}
-            self.sat_trail.clear(); self.ast_trail.clear()
+            self._reset_locked()
         print("[sim3d] reset (reset_id=%d)" % self.reset_id, flush=True)
+
+    def _reset_locked(self):
+        self.phys.reset()
+        self.reset_id += 1
+        self.isolated = []
+        self.branch = {v: "A" for v in config.VALVES}
+        self.sat_trail.clear(); self.ast_trail.clear()
+        self.ar = {"dodged": False, "ball_home": False, "home_since": None}
+
+    def _rewind_update(self, now):
+        """After an auto reset the person brings the ball back out THROUGH the satellite's position:
+        hide the asteroid and count no collision until the ball is back at the start (or out of view)."""
+        if not self.rewind:
+            return
+        t = self.track
+        seen = t is not None and t.get("detected") and t.get("pos") is not None and now - self.track_rx < 0.5
+        if seen:
+            self.rewind_last_seen = now
+            if t["pos"][2] >= config.REWIND_BALL_Z:
+                self.rewind = False
+        elif now - self.rewind_last_seen > config.REWIND_UNSEEN_S:
+            self.rewind = False
+        if not self.rewind:
+            print("[sim3d] rewind done: ready for the next pass", flush=True)
+
+    def _auto_reset(self, now):
+        """After a dodge: once the ball came close to the camera and the satellite is back home in
+        STATION_KEEP for AUTO_RESET_DELAY_S, reset the run (propellant, faults) for the next pass."""
+        if not config.AUTO_RESET:
+            return
+        ar = self.ar
+        cmd = self.cmd if (self.cmd and now - self.cmd_rx < config.SIM_CMD_TIMEOUT) else None
+        if cmd and cmd.get("phase") in ("EVADE", "HOLD_CLEAR"):
+            ar["dodged"] = True
+        t = self.track
+        if (ar["dodged"] and not ar["ball_home"] and t is not None and t.get("detected") and t.get("pos") is not None
+                and now - self.track_rx < 0.5 and t["pos"][2] <= config.AUTO_RESET_BALL_Z):
+            ar["ball_home"] = True
+            # the pass is over once the ball reached the camera: record it and hide the asteroid, so
+            # pulling the ball back out through the satellite (before or after the reset) is no collision
+            self._finish_encounter()
+            self.rewind, self.rewind_last_seen = True, now
+        home = (cmd is not None and cmd.get("phase") == "STATION_KEEP"
+                and float(np.linalg.norm(self.phys.pos)) < config.REACHED_POS)
+        if ar["dodged"] and ar["ball_home"] and home:
+            if ar["home_since"] is None:
+                ar["home_since"] = now
+            elif now - ar["home_since"] >= config.AUTO_RESET_DELAY_S:
+                self._finish_encounter()          # (already reported when the ball reached the camera)
+                rewinding = self.rewind
+                self._reset_locked()
+                self.auto_resets += 1
+                if rewinding:                     # keep waiting for the ball to be brought back out
+                    self.rewind = True
+                print("[sim3d] AUTO RESET #%d: satellite back in orbit, ball at the camera (reset_id=%d)" % (
+                    self.auto_resets, self.reset_id), flush=True)
+        else:
+            ar["home_since"] = None
 
     def quit(self):
         self.running = False
@@ -394,7 +529,9 @@ class Sim3D(ShowBase):
                     self._send_nav()
                 if self.mock and k % 7 == 0:
                     self._send_mock(now)
+                self._rewind_update(now)
                 self._encounter(now)
+                self._auto_reset(now)
             k += 1
             next_t += period
             if time.perf_counter() - next_t > 0.1:      # never try to catch up more than 100 ms
@@ -462,6 +599,8 @@ class Sim3D(ShowBase):
             pass
 
     def asteroid_pos(self, now):
+        if self.rewind:                     # ball being brought back out after a reset: not a threat
+            return None
         t = self.track
         if t is None or not t.get("detected") or t.get("pos") is None:
             return None
@@ -481,7 +620,11 @@ class Sim3D(ShowBase):
             e["last"] = now
             e["max_disp"] = max(e["max_disp"], float(np.linalg.norm(self.phys.pos)))
         elif self.enc is not None and now - self.enc["last"] > config.ENCOUNTER_END_S:
-            e = self.enc
+            self._finish_encounter()
+
+    def _finish_encounter(self):
+        e = self.enc
+        if e is not None:
             self.enc = None
             hit = e["min_sat"] < config.COLLISION_DIST
             self.hits += int(hit)
@@ -526,11 +669,13 @@ class Sim3D(ShowBase):
             pl.show() if on else pl.hide()
         if cmd:
             self.target_np.setPos(to_scene(cmd.get("target", [0, 0, 0])))
+        ap = self._smooth_asteroid(ap, now)        # display: smoothed + held through dropouts
         if ap is not None:
             self.asteroid.show(); self.asteroid.setPos(to_scene(ap))
             self.asteroid.setHpr(now * 20, now * 7, 0)
         else:
             self.asteroid.hide()
+        self._update_feed(now)
 
         if now - self._trail_t > 0.1:
             self._trail_t = now
@@ -559,12 +704,17 @@ class Sim3D(ShowBase):
 
         # camera
         cam = self.camera
+        far = (0.75 - config.SAT_BOARD_Z) * config.SPACE_SCALE                  # ball's start (scene Y)
         if self.view == 1:
-            cam.setPos(sp + Vec3(10, -32, 12)); cam.lookAt(sp + Vec3(0, 14, 0))
+            cam.setPos(sp + Vec3(12, -40, 14)); cam.lookAt(sp + Vec3(0, 30, 0))
         elif self.view == 2:
-            cam.setPos(Vec3(sp[0] * 0.5, 12, 62)); cam.lookAt(Vec3(sp[0] * 0.5, 13, 0), Vec3(0, 1, 0))
-        else:
+            # top view of the dodge zone around the satellite (the ball's last ~15 cm before it and after)
+            cam.setPos(Vec3(sp[0] * 0.5, 8.0, 85.0)); cam.lookAt(Vec3(sp[0] * 0.5, 9.0, 0), Vec3(0, 1, 0))
+        elif self.view == 3:
             cam.setPos(sp + qq.xform(Vec3(0, config.SAT_SIZE / 2 + 0.2, 0.2))); cam.setQuat(qq)
+        else:   # 4: from the real camera's position, looking out past the satellite toward the ball's start
+            # the real camera is far behind (SAT_BOARD_Z * SPACE_SCALE): look from part way, along its axis
+            cam.setPos(Vec3(2.5, max(self.cam_y * 0.3, -28.0), 4.0)); cam.lookAt(Vec3(0, 0.35 * far, 0))
 
         # disparity texture
         if depth is not None:
@@ -581,7 +731,7 @@ class Sim3D(ShowBase):
         # HUD
         f3 = lambda v: "[%6.2f %6.2f %6.2f]" % tuple(v)
         L = ["DODGE-1   mission t %7.1f s   x%g time   view %s%s" % (
-            t, config.TIME_SCALE, {1: "chase", 2: "side", 3: "onboard"}[self.view], "   [MOCK BALL]" if mock else "")]
+            t, config.TIME_SCALE, {1: "chase", 2: "top", 3: "onboard", 4: "camera's eye"}[self.view], "   [MOCK BALL]" if mock else "")]
         if cmd is None:
             self.banner.setText("NO FLIGHT COMPUTER - satellite cannot act\n"
                                 "start  python control.py  (or supervisor.py)  -> commands to %s:%d"
@@ -614,9 +764,16 @@ class Sim3D(ShowBase):
                 lp.get("work_ms", 0), lp.get("jitter_max_ms", 0), lp.get("overruns", 0)))
         if stuck:
             L.append("INJECTED FAULT: valve %s stuck open" % stuck)
+        if self.rewind:
+            L.append("RESET DONE - bring the ball back out (>= %d cm) for the next pass" % int(config.REWIND_BALL_Z * 100))
         self.hud_l.setText("\n".join(L))
 
         R = ["PERCEPTION (Pi)  %.1f Hz" % rate]
+        if track and track_age < 1.0 and track.get("detected") and track.get("pos") is not None:
+            R.append("BALL %.2f m from camera (sat %.2f, dodge <%.2f)" % (
+                track["pos"][2], config.SAT_BOARD_Z, config.SAT_BOARD_Z + config.TRIGGER_RANGE / config.SPACE_SCALE))
+        else:
+            R.append("BALL not detected")
         if track and track_age < 1.0:
             R.append("classifier %s  detected %s" % (track.get("classifier"), track.get("detected")))
             R.append("reason %s" % track.get("reason"))
@@ -638,7 +795,7 @@ class Sim3D(ShowBase):
         else:
             R.append("no supervisor status")
         self.hud_r.setText("\n".join(R))
-        self.hud_b.setText("encounters %d   hits %d   last: %s" % (enc_n, hits, last_enc))
+        self.hud_b.setText("encounters %d   hits %d   auto resets %d   last: %s" % (enc_n, hits, self.auto_resets, last_enc))
         return task.cont
 
 

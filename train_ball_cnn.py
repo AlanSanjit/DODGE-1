@@ -2,9 +2,9 @@
 
 Training patches come from the SAME pipeline perception uses on the Pi
 (find_candidates -> crop_patch, 32x32x3), run on randomized synthetic scenes, plus procedural
-orange non-ball shapes, plus any real patches saved with
+non-ball shapes in the ball's colour (boxes, sheets, bars...), plus any real patches saved with
     python3 perception.py --source qnx --save-patches data/ball       (ball only in view)
-    python3 perception.py --source qnx --save-patches data/not_ball   (orange distractors, no ball)
+    python3 perception.py --source qnx --save-patches data/not_ball   (distractors in the ball's colour, no ball)
 
     python train_ball_cnn.py [--scenes 60] [--epochs 15]
 Output: ball_cnn_int8.tflite (int8 in, int8 out, class 0 = ball, 1 = not ball).
@@ -51,15 +51,24 @@ def math_dist(c, uv):
 
 
 def shape_negatives(n, seed=7):
-    """Orange things that are NOT a ball: boxes, bars, triangles, elongated blobs, rings."""
+    """Ball-coloured things that are NOT a ball: boxes, bars, triangles, elongated blobs, paper with text."""
     rng = np.random.default_rng(seed)
     out = []
     yy, xx = np.mgrid[0:32, 0:32].astype(np.float32)
     for i in range(n):
         bg = rng.uniform(60, 200, 3)[None, None, :] * (0.8 + 0.4 * rng.random((32, 32, 1)))
         img = bg.copy()
-        col = np.array([rng.uniform(200, 255), rng.uniform(80, 140), rng.uniform(5, 45)])
-        kind = i % 5
+        if config.BALL_COLOR == "black":
+            k0 = rng.uniform(5, 70)
+            col = np.array([k0, k0 + rng.uniform(-5, 5), k0 + rng.uniform(-4, 8)])
+            bg = rng.uniform(90, 220, 3)[None, None, :] * (0.8 + 0.4 * rng.random((32, 32, 1)))
+            img = bg.copy()
+        elif config.BALL_COLOR == "white":
+            w0 = rng.uniform(170, 255)
+            col = np.array([w0, w0 + rng.uniform(-10, 10), w0 + rng.uniform(-20, 8)])
+        else:
+            col = np.array([rng.uniform(200, 255), rng.uniform(80, 140), rng.uniform(5, 45)])
+        kind = i % 6
         cx, cy = rng.uniform(12, 20, 2)
         if kind == 0:   # box / square
             a, b = rng.uniform(8, 15, 2)
@@ -73,9 +82,15 @@ def shape_negatives(n, seed=7):
             xr = (xx - cx) * np.cos(th) + (yy - cy) * np.sin(th)
             yr = -(xx - cx) * np.sin(th) + (yy - cy) * np.cos(th)
             m = (xr / a) ** 2 + (yr / b) ** 2 < 1
-        else:            # flat (unshaded) full patch
+        elif kind == 4:  # flat (unshaded) full patch
             m = np.ones((32, 32), bool)
+        else:            # sheet of paper with text lines
+            m = (np.abs(xx - cx) < rng.uniform(9, 15)) & (np.abs(yy - cy) < rng.uniform(9, 15))
         img[m] = col * rng.uniform(0.85, 1.05)
+        if kind == 5:
+            for r0 in range(int(cy) - 8, int(cy) + 9, 4):
+                img[r0:r0 + 1, int(cx) - 8:int(cx) + rng.integers(0, 8)] = (
+                    rng.uniform(150, 230) if config.BALL_COLOR == "black" else rng.uniform(20, 80))
         img += rng.normal(0, 3, img.shape)
         out.append(np.clip(img, 0, 255).astype(np.uint8))
     return out
@@ -133,11 +148,15 @@ def main():
     rx, ry = real_patches()
     X += rx * 3; y += ry * 3       # weight real data
     X = np.stack(X); y = np.array(y)
-    # augmentation: horizontal flips + brightness
+    # augmentation: flips, brightness, colour cast (webcam white balance), blur (webcam focus)
     rng = np.random.default_rng(0)
     Xf = X[:, :, ::-1]
     Xb = np.clip(X.astype(np.float32) * rng.uniform(0.7, 1.25, (len(X), 1, 1, 1)), 0, 255).astype(np.uint8)
-    X = np.concatenate([X, Xf, Xb]); y = np.concatenate([y, y, y])
+    Xc = np.clip(X.astype(np.float32) * rng.uniform(0.85, 1.15, (len(X), 1, 1, 3)), 0, 255).astype(np.uint8)
+    Xs = X.astype(np.float32)
+    Xs = (Xs + np.roll(Xs, 1, 1) + np.roll(Xs, -1, 1) + np.roll(Xs, 1, 2) + np.roll(Xs, -1, 2)) / 5.0
+    Xs = np.clip(Xs + rng.normal(0, 3, Xs.shape), 0, 255).astype(np.uint8)
+    X = np.concatenate([X, Xf, Xb, Xc, Xs]); y = np.concatenate([y, y, y, y, y])
     idx = rng.permutation(len(X)); X, y = X[idx], y[idx]
     n_test = len(X) // 7
     Xte, yte, Xtr, ytr = X[:n_test], y[:n_test], X[n_test:], y[n_test:]

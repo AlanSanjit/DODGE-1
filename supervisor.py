@@ -26,8 +26,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 class Proc:
-    def __init__(self, name, script, args, prio, cpus, hb_timeout, grace):
-        self.name, self.script, self.args = name, script, args
+    def __init__(self, name, script, args, prio, cpus, hb_timeout, grace, exe=None):
+        self.name, self.script, self.args, self.exe = name, script, args, exe
         self.prio, self.cpus = prio, cpus
         self.hb_timeout, self.grace = hb_timeout, grace
         self.p = None
@@ -35,13 +35,21 @@ class Proc:
         self.last_hb = None
         self.restarts = 0
         self.last_event = "init"
+        self.quick_fails = 0        # consecutive crashes within 3 s of starting
+        self.restart_at = None      # back-off: when to start again
 
     def cmdline(self):
-        cmd = [sys.executable, "-u", os.path.join(HERE, self.script)] + self.args
-        if shutil.which("on"):      # QNX: priority + core pinning
+        if self.exe:                # native program (stereo_capture)
+            cmd = [self.exe] + self.args
+        else:
+            cmd = [sys.executable, "-u", os.path.join(HERE, self.script)] + self.args
+        if shutil.which("on"):      # QNX: priority (+ optional pinning)
             pre = ["on", "-p", str(self.prio)]
-            for c in self.cpus:
-                pre += ["-C", str(c)]
+            # QNX 8.0: `on -C` selects a CPU *cluster* (the Pi 5 has one: 0), not a core, and accepts a
+            # single value - "-C 1 -C 2 -C 3" fails with "Invalid cluster runmask". So pinning is off by
+            # default; priority is what protects the control loop.
+            if config.PIN_CPUS and self.cpus:
+                pre += ["-C", str(self.cpus[0])]
             cmd = pre + cmd
         return cmd
 
@@ -74,6 +82,8 @@ class Proc:
         """Returns 'CRASH', 'HANG' or None."""
         if self.p.poll() is not None:
             return "CRASH"
+        if self.hb_timeout is None:   # no heartbeat protocol (native capture): crash detection only
+            return None
         in_grace = self.last_hb is None and now - self.started < self.grace
         if not in_grace and self.hb_age(now) > self.hb_timeout:
             return "HANG"
@@ -92,6 +102,20 @@ def main():
                            config.PERCEPTION_PRIO, [1, 2, 3],
                            config.PERCEPTION_HB_TIMEOUT, config.PERCEPTION_GRACE_S),
     }
+    use_capture = args.source == "qnx" and not ("--qnx-backend" in extra and "ctypes" in extra)
+    if use_capture:
+        exe = None
+        for cand in (os.path.join(HERE, "stereo_capture"), os.path.join(HERE, "qnx", "stereo_capture")):
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                exe = cand
+                break
+        if exe is None:
+            print("[supervisor] WARNING: --source qnx but no compiled stereo_capture found "
+                  "(clang -O2 -o stereo_capture qnx/stereo_capture.c -lcamapi)", flush=True)
+        else:
+            cap_args = ["-n", "1", "-u", str(config.MONO_UNIT)] if config.CAMERA_MODE == "mono" else []
+            procs["capture"] = Proc("capture", None, cap_args, config.CAPTURE_PRIO, [1, 2, 3], None, 0.0, exe=exe)
+            procs = {k: procs[k] for k in ("control", "capture", "perception")}   # start order
     hb_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     hb_sock.bind(("127.0.0.1", config.SUPERVISOR_PORT))
     hb_sock.setblocking(False)
@@ -121,17 +145,31 @@ def main():
                 if msg.get("type") == "hb" and msg.get("name") in procs:
                     procs[msg["name"]].last_hb = now
             for p in procs.values():
+                if p.restart_at is not None:           # waiting out a back-off
+                    if now >= p.restart_at:
+                        p.restart_at = None
+                        p.start()
+                    continue
                 ev = p.check(now)
                 if ev is None:
+                    if now - p.started > 10.0:
+                        p.quick_fails = 0
                     continue
                 code = p.p.poll()
                 detail = "exit code %s" % code if ev == "CRASH" else "no heartbeat %.2f s" % p.hb_age(now)
-                print("[supervisor] %s %s (pid %d, %s) -> restart" % (p.name, ev, p.p.pid, detail), flush=True)
                 if ev == "HANG":
                     p.kill()
                 p.restarts += 1
                 p.last_event = "%s at %s" % (ev, time.strftime("%H:%M:%S"))
-                p.start()
+                p.quick_fails = p.quick_fails + 1 if now - p.started < 3.0 else 0
+                delay = min(5.0, 0.5 * (2 ** (p.quick_fails - 1))) if p.quick_fails > 1 else 0.0
+                print("[supervisor] %s %s (pid %d, %s) -> restart%s" % (
+                    p.name, ev, p.p.pid, detail, " in %.1f s (keeps failing at start)" % delay if delay else ""),
+                    flush=True)
+                if delay:
+                    p.restart_at = now + delay
+                else:
+                    p.start()
             if now - last_status >= 1.0 / config.PROCS_HZ:
                 last_status = now
                 st = {"type": "procs", "procs": {}}

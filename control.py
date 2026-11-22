@@ -65,6 +65,7 @@ class Controller:
         self.phase = "STATION_KEEP"
         self.target = np.zeros(3)
         self.dodge_axis = None
+        self.v_limit = config.V_MAX
         self.branch = {v: "A" for v in config.VALVES}
         self.isolated = set()
         self.fault = None
@@ -155,12 +156,22 @@ class Controller:
         approaching = closing and math.sqrt(vv) > 0.1
         trigger = rng <= config.TRIGGER_RANGE or (
             approaching and t_cpa <= config.MISS_HORIZON and miss < config.MISS_TRIGGER)
+        if config.TRIGGER_FRONT_ONLY:
+            # a threat comes from the front (along-track +y) toward the satellite: the ball moving toward
+            # the camera. Taking the ball back out after a pass must not trigger a dodge.
+            trigger = trigger and approaching and v[1] < -0.1 and r[1] > -config.COLLISION_DIST
         return {"range": rng, "t_cpa": t_cpa, "miss": miss, "trigger": bool(trigger),
                 "approaching": bool(approaching), "miss_vec": m, "rel_vel": v}
 
     def plan_dodge(self, thr, ast):
-        """Target DODGE_DIST perpendicular to the approach line: cross-track (z) first, then radial (x).
-        Never along-track. Needs both directions of the axis (go AND brake)."""
+        """Dodge perpendicular to the approach line: cross-track (z) first, then radial (x).
+        Never along-track. Needs both directions of the axis (go AND brake).
+        Returns (target LVLH, axis, speed limit) or (None, None, None).
+
+        DODGE_MODE "fixed":    always DODGE_DIST at V_MAX.
+        DODGE_MODE "min_fuel": fuel ~ total delta-v = 2 x speed (burn + brake), so move only as far as
+        needed for a SAFE_MISS closest approach (+ margin) and only as fast as needed to get there
+        before the asteroid does (t_cpa)."""
         u = ast["vel"]
         if np.linalg.norm(u) < 0.2:
             u = -(ast["pos"] - self.nav["pos"])
@@ -170,27 +181,55 @@ class Controller:
                 continue
             if abs(u[k]) > 0.8:
                 continue
-            mk = thr["miss_vec"][k]
-            if abs(mk) > 0.5:
-                s = -math.copysign(1.0, mk)
-            else:
-                ak = ast["pos"][k] - self.nav["pos"][k]
-                s = -math.copysign(1.0, ak) if abs(ak) > 0.5 else 1.0
+            # Robust (min-max) dodge. Where will the asteroid cross the satellite's plane on this axis?
+            # Two estimates: its CURRENT offset and the PREDICTED miss (extrapolated with a noisy velocity,
+            # and a hand path may drift sideways); each may also be off by NOISE_SIGMAS of position
+            # noise (SPACE_SCALE times the ball's). For each side, compute the move that clears the worst
+            # of these, then take the side that needs the smaller move.
+            r_now = ast["pos"] - self.nav["pos"]
+            m_pred = thr["miss_vec"]
+            unc = config.NOISE_SIGMAS * config.TRACK_POS_SIGMA_M * config.SPACE_SCALE
+            cands = (r_now[k], m_pred[k])
+            # clearance still needed on this axis given the (smallest) offset on the other axes
+            m_other = np.where(np.abs(r_now) < np.abs(m_pred), r_now, m_pred)
+            m_other = np.sign(m_other) * np.maximum(np.abs(m_other) - unc, 0.0)
+            other2 = max(0.0, float(m_other @ m_other) - m_other[k] * m_other[k])
+            need = math.sqrt(max(0.0, config.SAFE_MISS ** 2 - other2))
+            # moving s*d: clearance to an asteroid at lateral a is s*d - a  ->  d >= s*a + unc + need
+            d_side = {sg: max(sg * a for a in cands) + unc + need for sg in (1.0, -1.0)}
+            s = min(d_side, key=lambda sg: (d_side[sg], -sg * -r_now[k]))
             tgt = np.zeros(3)
-            tgt[k] = s * config.DODGE_DIST
-            return tgt, k
-        return None, None
+            if config.DODGE_MODE != "min_fuel":
+                tgt[k] = s * config.DODGE_DIST
+                return tgt, k, config.V_MAX
+            d = min(max(d_side[s] + config.DODGE_MARGIN, config.DODGE_MIN), config.DODGE_DIST)
+            tgt[k] = max(-config.DODGE_DIST, min(config.DODGE_DIST, self.nav["pos"][k] + s * d))
+            T = thr["t_cpa"] if thr["approaching"] else 0.0
+            if T > 0.0:
+                v = d / max(config.DODGE_TIME_FRAC * T, 0.5)   # arrive with time to spare
+            else:
+                v = config.V_RETURN                           # no deadline: slow and cheap
+            v = min(max(v, config.V_DODGE_MIN), config.V_MAX)
+            return tgt, k, v
+        return None, None, None
 
-    def guidance(self, pos, vel, mass):
+    def guidance(self, pos, vel, mass, v_max=None):
         """Bang-coast-bang per LVLH axis. Returns desired accel direction (-1/0/+1 per axis), motion."""
         a = config.THRUST_N / mass
+        v_lim = config.V_MAX if v_max is None else v_max
+        # one control tick of thrust changes the speed by dv_tick (mission time per tick grows with
+        # TIME_SCALE); deadbands smaller than that make bang-bang chatter and burn the tank
+        dv_tick = a * config.TIME_SCALE / config.CONTROL_HZ
+        # (must stay below REACHED_VEL, or RETURN never completes)
+        vel_db = min(max(config.VEL_DEADBAND, 1.2 * dv_tick), 0.8 * config.REACHED_VEL)
+        pos_db = max(config.POS_DEADBAND, 2.0 * dv_tick * config.TIME_SCALE / config.CONTROL_HZ)
         d = np.zeros(3)
         modes = []
         for k in range(3):
             e = self.target[k] - pos[k]
             v = vel[k]
-            if abs(e) < config.POS_DEADBAND:
-                if abs(v) > config.VEL_DEADBAND:
+            if abs(e) < pos_db:
+                if abs(v) > vel_db:
                     d[k] = -math.copysign(1.0, v); modes.append("BRAKE")
                 else:
                     modes.append("HOLD")
@@ -200,9 +239,9 @@ class Controller:
             stop = v * v / (2 * a) + abs(v) * config.LATENCY_MARGIN_S
             if v_toward > 0 and stop >= abs(e):
                 d[k] = -sgn; modes.append("BRAKE")
-            elif v_toward < config.V_MAX:
+            elif v_toward < v_lim:
                 d[k] = sgn; modes.append("BURN")
-            elif v_toward > config.V_MAX * 1.1:
+            elif v_toward > v_lim + max(0.1 * v_lim, 1.5 * dv_tick):
                 d[k] = -sgn; modes.append("BRAKE")
             else:
                 modes.append("COAST")
@@ -243,6 +282,13 @@ class Controller:
         if old is None:
             return
         t0, v0, rx0 = old
+        # Commands are timed in real time, the measured velocity in mission time. If the sim's mission
+        # clock did not advance steadily over the window (sim hiccup, Wi-Fi burst), the two windows do
+        # not line up and the residual is meaningless: skip rather than blame a healthy thruster.
+        rate = (t1 - t0) / max(rx1 - rx0, 1e-6)
+        if not (0.8 * config.TIME_SCALE <= rate <= 1.25 * config.TIME_SCALE):
+            self.fdir_since = None
+            return
         a_meas = (v1 - v0) / (t1 - t0) - sm.cw_accel(self.nav["pos"], self.nav["vel"])
         win = [c for c in self.cmd_hist if rx0 <= c[0] < rx1]
         if len(win) < 3:
@@ -321,13 +367,17 @@ class Controller:
                             "reason": self.track.get("reason")}
 
         # ------------------------------------------------ phase machine
+        trigger = thr is not None and thr["trigger"]
+        if (trigger and config.DODGE_MODE == "min_fuel" and not thr["approaching"]
+                and thr["range"] >= config.SAFE_MISS + config.DODGE_MARGIN):
+            trigger = False          # close but not approaching and already at a safe distance: no fuel spent
         if self.phase in ("STATION_KEEP", "RETURN"):
-            if thr is not None and thr["trigger"]:
-                tgt, k = self.plan_dodge(thr, ast)
+            if trigger:
+                tgt, k, v = self.plan_dodge(thr, ast)
                 if tgt is not None:
-                    self.target, self.dodge_axis, self.phase = tgt, k, "EVADE"
-                    print("[control] EVADE range=%.1f t_cpa=%.1f miss=%.1f -> target %s" % (
-                        thr["range"], thr["t_cpa"], thr["miss"], tgt.tolist()), flush=True)
+                    self.target, self.dodge_axis, self.phase, self.v_limit = tgt, k, "EVADE", v
+                    print("[control] EVADE range=%.1f t_cpa=%.1f miss=%.1f -> target %s at %.2f m/s" % (
+                        thr["range"], thr["t_cpa"], thr["miss"], np.round(tgt, 2).tolist(), v), flush=True)
                 else:
                     self.fault = "NO_DODGE_AXIS"
             elif self.phase == "RETURN" and self._reached(pos, vel):
@@ -340,21 +390,22 @@ class Controller:
             if ast is not None:
                 p_slot = ast["pos"]
                 radial = float(p_slot @ ast["vel"]) / max(np.linalg.norm(p_slot), 1e-6)
-                far_away = (ast["ball_range"] > config.RETURN_BALL_RANGE
-                            and radial > -config.APPROACH_SPEED_MIN
-                            and np.linalg.norm(p_slot) > config.TRIGGER_RANGE)
+                # passed the satellite (or stopped/receding) and clear of it -> fly home
+                far_away = (np.linalg.norm(p_slot) > config.CLEAR_RANGE
+                            and radial > -config.APPROACH_SPEED_MIN)
             if unseen or far_away:
                 self.target = np.zeros(3)
                 self.phase = "RETURN"
+                self.v_limit = config.V_RETURN if config.DODGE_MODE == "min_fuel" else config.V_MAX
                 print("[control] threat gone (%s) -> RETURN" % ("unseen" if unseen else "receding"), flush=True)
             elif self.phase == "EVADE" and self._reached(pos, vel):
                 self.phase = "HOLD_CLEAR"
             elif (self.phase == "HOLD_CLEAR" and thr is not None and thr["approaching"]
                   and thr["t_cpa"] <= config.MISS_HORIZON and thr["miss"] < config.MISS_TRIGGER):
-                tgt, k = self.plan_dodge(thr, ast)
+                tgt, k, v = self.plan_dodge(thr, ast)
                 if tgt is not None and np.linalg.norm(tgt - self.target) > 1.0:
-                    self.target, self.dodge_axis, self.phase = tgt, k, "EVADE"
-                    print("[control] re-plan EVADE -> %s" % tgt.tolist(), flush=True)
+                    self.target, self.dodge_axis, self.phase, self.v_limit = tgt, k, "EVADE", v
+                    print("[control] re-plan EVADE -> %s at %.2f m/s" % (np.round(tgt, 2).tolist(), v), flush=True)
 
         # ------------------------------------------------ translation
         valves = []
@@ -362,7 +413,10 @@ class Controller:
         if nav["prop"] <= config.PROP_MIN:
             self.fault = "PROP_DEPLETED"
         else:
-            d, motion = self.guidance(pos, vel, mass)
+            v_lim = self.v_limit
+            if self.phase in ("STATION_KEEP", "RETURN") and config.DODGE_MODE == "min_fuel":
+                v_lim = config.V_RETURN
+            d, motion = self.guidance(pos, vel, mass, v_lim)
             valves = self.select_valves(d, R)
             self.fdir(now, R, mass, valves)
             valves = [v for v in valves if self.valve_ok(v)]
