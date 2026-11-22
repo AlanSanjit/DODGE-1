@@ -1,180 +1,205 @@
-# CLAUDE.md: QNX Edge-AI Satellite Debris Avoidance
+# CLAUDE.md: DODGE-1, QNX edge-AI satellite debris avoidance
 
 ## What this project is
-Hackathon project (QNX edge-AI challenge). A **Raspberry Pi 5 running QNX 8.0** is the flight
-computer of a simulated satellite. A person moves a real **orange 40 mm ping-pong ball** in front
-of **two cameras** mounted on the Pi. A **TFLite CNN** confirms the ball in both images, **stereo
-disparity** gives its distance, and when the ball is within **20 cm** of the board the Pi commands
-simulated **cold-gas thrusters** to sidestep the "asteroid" and then return to the original orbit slot.
-A **laptop** runs a **3D simulator** (Panda3D) that plays "the universe": rigid-body physics, orbit,
-rendering, dashboard. **All sensing and decisions run on the Pi; the laptop only simulates and draws.**
+Hackathon project (QNX edge-AI challenge). A **Raspberry Pi 5 running QNX 8.0** is the flight computer of a
+simulated satellite. A person pushes a real **black 35 mm ball** toward **one USB webcam** on the Pi. An **int8
+TFLite CNN** (with a geometric shape fallback) recognises the ball, **depth comes from the ball's known size**,
+and when the ball is within 15 cm of the satellite's virtual position (30 cm in front of the camera) the Pi
+commands simulated **cold-gas thrusters** to sidestep with minimum propellant, then return to the orbit slot.
+A **laptop** runs a 3D simulator (Panda3D): rigid-body physics, rendering, dashboard, the Pi's camera feed.
+**All sensing and decisions run on the Pi; the laptop only simulates and draws.**
+Two-camera stereo mode still exists (`CAMERA_MODE = "stereo"`) but the current setup is mono.
 
-PRD (goals, requirements, phases): https://claude.ai/artifact/2Ji33PdA42CRRXoRfDWQid
-
-### Judging criteria (every change must keep serving these)
+### Judging criteria (every change must keep serving these; README.md answers them in detail)
 1. Cannot-fail embedded application: AI isolated from safety, auto-restart, fail-safe states.
-2. Real-time / reliability: fixed 50 Hz control loop, priorities, core pinning, measured jitter.
-3. Creative AI: CNN must confirm the ball in BOTH cameras before stereo depth is trusted.
+2. Real-time / reliability: fixed 50 Hz control loop, priorities, measured jitter.
+3. Creative AI: CNN on the edge + hybrid detection + physics-based plausibility + robust min-fuel planning.
 4. Runs on embedded hardware: no cloud; the laptop only plays the physical world (hardware-in-the-loop).
-Core message for the pitch: **"The AI suggests, the QNX control process decides."**
+Core message: **"The AI suggests, the QNX control process decides."**
 
 ## Hardware and environment
-- Raspberry Pi 5, QNX SDP 8.0 Quick Start Target Image (QSTI). Hostname `qnxpi` (`qnxpi.local`),
-  user `qnxuser`, SSH enabled, VNC GUI on port 5900. Python 3 is preinstalled.
-- Packages on the Pi come from `apk` (QNX open-source ports, https://oss.qnx.com):
-  `python3-tflite-runtime` 2.21 (aarch64, QNX 8.0.3). **No OpenCV on the Pi**: Pi code is numpy + tflite only.
-- Cameras: 2x Raspberry Pi Camera Module 3. On the QNX Pi 5 image they are sensor units **3 (camera 1)**
-  and **4 (camera 2)**. Config: `/etc/config/sensor/sensor_rpi5.conf`. View one: `camera_mux -n 1 -u 3`.
-  Restart the sensor service: `slay sensor` then
-  `sensor -U 521:521 -r /data/share/sensor -b external -c /etc/config/sensor/sensor_rpi5.conf`.
-  Frames are read through the QNX camera library (C API), not V4L2.
-- Laptop: Python 3, `pip install panda3d numpy tensorflow opencv-python`.
-- Link: wired Ethernet laptop <-> Pi preferred (Wi-Fi drops trigger the safety shutdowns).
+- Raspberry Pi 5, QNX SDP 8.0 Quick Start Target Image (TAGID QNXOS_805). Hostname `qnxpi`, user `qnxuser`
+  (in groups sensor/521, sudo). Root via `su -` or `sudo`. Python 3.14 on the Pi.
+- Pi packages via `apk`: `python3-numpy`, `python3-tflite-runtime`. **Compiler: QNX clang** is preinstalled
+  (`clang`, `/usr/lib/llvm22/bin`); there is no `gcc` package. Pi code: numpy + tflite_runtime + stdlib + C.
+- Laptop (Windows): `pip install panda3d numpy tensorflow opencv-python`. Laptop SSH alias `qnxpi` in
+  `~/.ssh/config` forces `MACs hmac-sha2-256` (Windows OpenSSH + the Pi's sshd otherwise fail with
+  "Corrupted MAC on input"). Network: iPhone hotspot, laptop 172.20.10.2, Pi 172.20.10.3 (DHCP, re-check).
+- Laptop firewall must allow inbound UDP 5005 (sim), 5008 (live_view), 5009 (sim camera feed).
 
 ## Files
 | File | Runs on | Role |
 |---|---|---|
-| `config.py` | both (IDENTICAL copy) | every shared constant: IPs/ports, scaling, physics, thresholds |
-| `spacemath.py` | both | quaternion helpers, `HandScenario` (synthetic hand-held ball) |
-| `perception.py` | Pi | cameras -> CNN -> stereo depth -> Kalman -> `track` msgs (LOW priority) |
-| `control.py` | Pi | 50 Hz guidance/attitude/FDIR -> `cmd` msgs (HIGH priority) |
-| `supervisor.py` | Pi | starts perception + control as separate processes, restarts on crash/hang |
-| `sim3d.py` | laptop | 3D rigid-body simulator + dashboard (the "universe") |
-| `train_ball_cnn.py` | laptop | trains the ball/not-ball CNN, exports `ball_cnn_int8.tflite` |
-| `stereo_calibrate.py` | laptop | checkerboard stereo calibration -> `calib.json`, `rectify_maps.npz` |
-| `ball_cnn_int8.tflite` | Pi | model (32x32x3 int8 in, 2 classes out: 0 = ball, 1 = not ball) |
-`sim_satellite.py` (old 2D sim) is retired: its message format is outdated. Do not revive it.
+| `config.py` | both (IDENTICAL copy) | every shared constant |
+| `spacemath.py` | both | quaternions, `ball_to_space`, `ball_in_view` (mono/stereo), `HandScenario` (synthetic hand) |
+| `perception.py` | Pi, prio 15 | sources (synthetic / QNX mono / QNX stereo) -> candidates -> CNN/shape -> depth -> Kalman -> `track`; preview senders; `--calibrate-f` |
+| `control.py` | Pi, prio 40 | 50 Hz guidance / attitude / FDIR / fail-safe -> `cmd` |
+| `supervisor.py` | Pi | starts control, capture (C), perception with `on -p`; crash/hang restart with back-off |
+| `qnx/stereo_capture.c` | Pi, prio 20 | QNX camera library -> `/dev/shmem/dodge_stereo` (seqlock); `-n 1` mono |
+| `qnx/sensor_dodge_mono.conf` / `qnx/sensor_dodge_usb.conf` | Pi | sensor-service configs (1 camera wildcard / 2 cameras bus+dev) |
+| `qnx/start_cameras.sh` | Pi (root) | restart the sensor service with a config; checks /dev/sensor |
+| `qnx_camera.py` | Pi | `ShmStereo` reader, `to_rgb` (YUYV/UYVY/NV12/RGB...), `python3 qnx_camera.py --snapshot` check; ctypes path (crashes on QNX 8.0, kept for other systems) |
+| `sim3d.py` | laptop | physics, views 1-4, dashboard, camera-feed panel, auto reset / rewind |
+| `live_view.py` | laptop | full-size annotated Pi camera view; `PreviewReceiver` + `render` reused by sim3d |
+| `train_ball_cnn.py` | laptop | trains `ball_cnn_int8.tflite` from synthetic (+ `data/ball`, `data/not_ball`) patches |
+| `stereo_calibrate.py` | laptop | checkerboard stereo calibration (stereo mode) |
+| `ball_cnn_int8.tflite` | Pi | int8 CNN, 32x32x3 in, 2 classes (0 = ball). Current model: BLACK ball |
+| `calib.json` | Pi (generated, git-ignored) | focal length from `--calibrate-f` (read by `Camera()` on start) |
+| `RUN.md` / `README.md` | - | run guide / project write-up for the judges |
+`sim_satellite.py` (old 2D sim) is retired. Do not revive it.
 
-## Architecture and messages (all JSON over UDP)
-Ports: `SIM_PORT 5005` (laptop listens), `CONTROL_PORT 5006` (Pi control), `SUPERVISOR_PORT 5007` (Pi, localhost).
-IPs come from env vars `SIM_IP` (laptop) and `PI_IP` (Pi); both default to 127.0.0.1 (single-machine tests).
+## Architecture and messages (JSON over UDP unless noted)
+Ports: `SIM_PORT 5005` (laptop), `CONTROL_PORT 5006` (Pi control), `SUPERVISOR_PORT 5007` (Pi localhost),
+`PREVIEW_PORT 5008` (laptop live_view), `SIM_FEED_PORT 5009` (laptop sim feed). IPs from env `SIM_IP`, `PI_IP`.
 
 | From -> To | type | Rate | Fields |
 |---|---|---|---|
-| perception -> control (127.0.0.1:5006) and -> sim (SIM_IP:5005) | `track` | each frame (~30 Hz) | `seq, detected, reason, pos, vel` (board frame, m, m/s REAL time; null if not detected), `latency_s, classifier, cnn_ms, stereo_ms, n_candidates` (+ when detected: `disparity_px, depth_m, range_m, conf, match_ratio, uv, radius_px`) |
-| perception -> sim | `depthmap` | every 6th frame | `w=80, h=60, data` (base64 uint8, 0 = invalid, 255 = DISP_MAX/2 px), `ball` ([u,v] in map px or null) |
-| sim -> control (PI_IP:5006) | `nav` | 50 Hz | `t` (mission s), `pos, vel` (LVLH m, m/s mission), `q` [w,x,y,z] body->LVLH, `omega` (body rad/s), `h_w`, `mass, prop` (kg), `reset_id` |
-| control -> sim (SIM_IP:5005) | `cmd` | 50 Hz | `seq, phase, motion, target, valves` (e.g. ["+z"]), `torque` (wheel torque on body, N m), `isolated` (e.g. ["+z:A"]), `branch` ({"+z":"B"}), `fault, threat{range,t_cpa,miss,trigger,approaching}, track, att_err_deg, loop{work_ms,jitter_max_ms,overruns}` |
+| perception -> control (127.0.0.1) and sim | `track` | per frame (~15-20 Hz on Pi) | `seq, detected, reason, pos, vel` (board frame m, m/s REAL; null if not detected/confirmed), `latency_s, classifier, cnn_ms, stereo_ms, n_candidates` (+ when detected `disparity_px, depth_m, range_m, conf, match_ratio, uv, radius_px`) |
+| perception -> sim | `depthmap` | every 6th frame, **stereo only** | `w=80,h=60,data` (b64 uint8), `ball` |
+| sim -> control | `nav` | 50 Hz | `t` (mission s), `pos, vel` (LVLH m, m/s mission), `q` [w,x,y,z] body->LVLH, `omega`, `h_w`, `mass, prop`, `reset_id` |
+| control -> sim | `cmd` | 50 Hz | `seq, phase, motion, target, valves, torque, isolated, branch, fault, threat{range,t_cpa,miss,trigger,approaching}, track, att_err_deg, loop{work_ms,jitter_max_ms,overruns}` |
 | control, perception -> supervisor | `hb` | 10 Hz | `name` |
 | supervisor -> sim | `procs` | 2 Hz | `procs{name:{pid,prio,restarts,alive,hb_age,last_event}}` |
+| perception -> live_view / sim | binary preview | 8-10 Hz | `DPVM`+JSON meta (`mono, w, h, scale, cands_l/r [u,v,r,p], detected, reason, depth_m, size_ratio, depth_src, via, streak, fps, ...`), then `DPVC` + `<u4 fid,i,n>` + 1400-byte zlib chunks of the RGB image (1/`scale`) |
 Rule: **never change a message field without updating every sender and receiver in the same change.**
-Perception and control never share memory or import each other; they only exchange messages (isolation story).
+Perception and control never share memory or import each other (isolation story). The only shared memory is
+camera frames: stereo_capture (writer) -> perception (read-only mmap).
 
-## Frames, scaling, time
-- Board/camera frame (real, m): origin = midpoint between the cameras, X right, Y down, Z forward.
-- LVLH frame (space, m): x radial (up, away from Earth), y along-track (cameras look along +y),
-  z cross-track. Origin = the satellite's slot on its original orbit (= where the board is).
-- `CAM_TO_LVLH`: x = -Y_cam, y = Z_cam, z = X_cam. `ball_to_space(p) = SPACE_SCALE * CAM_TO_LVLH @ p`.
-- `SPACE_SCALE = 100` (1 cm of ball distance = 1 m), `TIME_SCALE = 5` (1 real s = 5 mission s).
-  Velocities: `ball_vel_to_space(v) = SPACE_SCALE / TIME_SCALE * CAM_TO_LVLH @ v`.
-- The asteroid shown = ball position x 100, drawn ONLY while `detected` is true and < 0.2 s old.
-- Panda3D scene mapping: scene = (-z, y, x) of LVLH (right-handed), 1 m = 1 scene unit.
+## Frames, scaling, demo geometry
+- Board/camera frame (real, m): origin = camera, X right, Y down, Z forward.
+- LVLH (space, m): x radial, y along-track (camera looks along +y), z cross-track. Origin = satellite slot.
+- **Satellite slot = `SAT_BOARD_Z` = 0.30 m in front of the camera.**
+  `ball_to_space(p) = SPACE_SCALE * CAM_TO_LVLH @ (p - [0,0,0.30])`; `CAM_TO_LVLH`: x=-Y, y=Z, z=X.
+- **`SPACE_SCALE = 300`** (1 real cm = 3 m; motion amplified 3x on request; asteroid size 1.75 m radius and
+  COLLISION_DIST 4 m kept). **`TIME_SCALE = 15`** (1 real s = 15 mission s): needed so 5 N thrusters can clear
+  a hand push with 15 cm of warning; 20 made station keeping chatter.
+- Demo: ball ~70 cm -> pushed through 30 cm -> ~10 cm. Dodge at 15 cm before the satellite (asteroid 45 m).
+- Panda3D scene = (-z, y, x) of LVLH. Real camera drawn at scene Y = -SAT_BOARD_Z*SPACE_SCALE (-90 m).
 
-## Physics model (sim3d.py) - keep it physically honest
-- Satellite: dry 23 kg + 2 kg N2, six body-fixed 5 N thrusters (`VALVES` "+x".."-z" = direction of the
-  acceleration they give), Isp 65 s, propellant flow = n * F / (Isp * g0).
-- Translation: a = R(q) * F_body / m (Newton 2), no drag (Newton 1: coasting persists),
-  Clohessy-Wiltshire terms with n = 2*pi/5554 s (400 km orbit).
-- Rotation: Euler's equations I*w' = tau_dist + tau_wheels - w x (I*w + h_wheels); disturbance torque
-  = -COM_OFFSET x F_body (thrust not through the centre of mass); wheels limited to 0.1 N m, 1.0 N m s.
-- Each thruster direction has a primary (A) and backup (B) branch; a stuck valve is injected as "+z:A".
-- Physics at 200 steps per real second; watchdog: no `cmd` for 150 ms -> all valves closed.
+## Physics model (sim3d.py `Physics`) - keep it physically honest
+Dry 23 kg + 2 kg N2, six body-fixed 5 N thrusters (A/B branches), Isp 65 s, mdot = n F / (Isp g0).
+Translation a = R F/m + Clohessy-Wiltshire (n = 2 pi/5554). Rotation: I w' = tau_dist + tau_w - w x (I w + h_w),
+tau_dist = -COM_OFFSET x F, wheels 0.1 N m / 1.0 N m s. Stuck valve injected as "+z:A" (stuck OPEN).
+Physics 200 steps per real s in its own thread; watchdog: no `cmd` for 150 ms -> commanded valves closed.
 
 ## Control logic (control.py)
-- Fixed 50 Hz loop (absolute next_t scheduling), counts overruns and jitter.
-- Phases: STATION_KEEP -> EVADE -> HOLD_CLEAR -> RETURN -> STATION_KEEP. Fail-safe phase NO_NAV_SAFE.
-- Trigger: asteroid range <= `TRIGGER_RANGE` (20 m = ball 20 cm) OR predicted miss < 8 m within 10 mission s.
-- Dodge target: 10 m (`DODGE_DIST`) perpendicular to the approach line; prefer cross-track (z), then
-  radial (x); never along-track (orbit drift). Needs both directions of an axis available (go AND brake).
-- Translation guidance per LVLH axis = bang-coast-bang: BURN until V_MAX (1.0 m/s), COAST, BRAKE when the
-  stopping distance v^2/2a (+ latency margin) reaches the remaining distance. a = THRUST_N / current mass.
-  Desired LVLH direction is rotated into the body frame (R^T) before choosing valves.
-- Return when the ball is unseen for 1.5 s or beyond 30 cm and not approaching (and not near the slot).
-- Attitude: PD on small-angle error, torque = -KP*theta - KD*omega, clipped to wheel limits.
-- FDIR: compare measured accel (from nav velocity over 1 mission s) with commanded; residual > 50% of one
-  thruster's accel for 0.3 s -> isolate that branch, switch to the backup.
-- Interlock: opposing thrusters never fire together. No nav for 0.3 s -> all valves closed.
+- Fixed 50 Hz loop, absolute next_t scheduling, jitter/overrun stats. Phases STATION_KEEP -> EVADE -> HOLD_CLEAR
+  -> RETURN -> STATION_KEEP; fail-safe NO_NAV_SAFE (no nav 0.3 s: all valves closed).
+- Asteroid from track only if fresh (<0.3 s incl. latency) and finite; extrapolated by its age.
+- **Trigger**: range <= TRIGGER_RANGE (45 m) AND approaching AND `TRIGGER_FRONT_ONLY` (asteroid moving -y, i.e.
+  ball moving toward the camera; pulling the ball back out never triggers). Predictive trigger off (MISS_HORIZON 0).
+- **Dodge (`DODGE_MODE = "min_fuel"`)**: cross-track z first, then radial x; never along-track; needs both
+  directions of the axis. Robust min-max: candidates for the crossing offset = current offset and predicted
+  miss, each widened by `unc = NOISE_SIGMAS * TRACK_POS_SIGMA_M * SPACE_SCALE`; for each side
+  d_side = max(side*a) + unc + sqrt(SAFE_MISS^2 - other^2); take the smaller; + DODGE_MARGIN, clipped
+  [DODGE_MIN, DODGE_DIST]. Speed v = d / (0.6 t_cpa) clipped [0.25, V_MAX 2]. `"fixed"` = 10 m at V_MAX.
+- Return when the asteroid is > CLEAR_RANGE (48 m = 16 cm) from the slot and not approaching, or unseen 1.5 s.
+  Return speed V_RETURN 0.3 m/s (cheap).
+- Guidance: bang-coast-bang per LVLH axis; deadbands scale with dv per control tick
+  (`vel_db = min(max(VEL_DEADBAND, 1.2 dv_tick), 0.8 REACHED_VEL)`), else chatter burns the tank.
+- Attitude PD on small-angle error, clipped to wheel limits.
+- **FDIR**: measured accel (nav velocity over FDIR_WINDOW 2 mission s) vs commanded; residual > 50% of one
+  thruster for 0.3 s -> isolate the branch (leak suspect first, then the commanded valve if the same axis
+  trips again), switch to B; never isolate a valve's last branch. **Skips windows where mission time per real
+  second is outside 0.8-1.25 x TIME_SCALE** (sim render stalls otherwise caused false isolations).
+- Interlock: opposing thrusters never fire together. PROP_DEPLETED disables thrusters.
 
 ## Perception (perception.py)
-1. `read()` returns (t_capture, left_rgb, right_rgb), each (240, 320, 3) uint8.
-2. Rectify with `rectify_maps.npz` (nearest-neighbour numpy indexing) if present.
-3. `find_candidates`: orange by normalised chromaticity (R/(R+G+B) > 0.45, B/(R+G+B) < 0.20),
-   connected components on a 4x grid. `crop_patch` -> 32x32 -> CNN. Ball must pass in BOTH images.
-4. Checks: same row within 6 px (epipolar), disparity in [2, 170] px, silhouette-match disparity
-   (search centroid disparity +/- 25 px) agrees with centroid disparity within max(4 px, 6%), and the
-   minimum is not on the search edge. Otherwise the frame is rejected and `reason` says why.
-5. Depth Z = f*B/d; position relative to the board centre; constant-velocity Kalman filter.
-6. Display disparity map: block matching (SAD) with a left-right consistency check, invalid = 0;
-   the ball blob is filled with its silhouette disparity (uniform ball cannot be matched per pixel).
-- `--source synthetic` renders a hand-held ball, a textured wall and an orange box distractor.
-- `--source qnx` uses `QnxStereoSource`, which is currently a **stub that raises NotImplementedError**.
+1. Sources: `SyntheticStereoSource` (renders the hand/ball/scene; `mono=True` -> one camera at X=0; clock starts
+   at the first frame), `QnxMonoSource` (shm camera 0), `QnxStereoSource` (shm 2 cameras, or ctypes backend).
+   `read()` -> (t_capture, left, right|None). No frame for CAM_TIMEOUT_S 2 s -> raise -> supervisor restarts.
+2. Candidates: `ball_mask` per `BALL_COLOR` ("black": max channel <= 100 and max-min <= 45; "white"; "orange"),
+   connected components on a 4x grid, area cap (mono: up to the ball at MONO_Z_MIN). If no blob passes the CNN:
+   `circle_candidates` (gradient Hough, half res, 3 radius bands x 2 peaks, outline circle fit `_refine_circle`).
+   `_same_object` dedups circles vs blobs only when near AND similar size.
+3. Classifier: CNN P(ball) >= 0.85; else **shape fallback** (`shape_ok`: fill 0.5-0.9, aspect <= 1.6; circle score
+   >= 0.5) AND **`isolated`** (ball-coloured inside, not in a ring outside) -> p 0.7, `via = "shape"`.
+4. **Mono depth** (`process_mono`): best candidate (CNN before shape); radius = max(area r, bbox/2) capped,
+   refined by circle fit; reject if cut by the image edge; r -= MONO_RADIUS_BIAS_PX (0.6); Z = f*(D/2)/r;
+   range [0.04, 1.2] m. Synthetic: depth within 1-4% from 8-80 cm, 98% detection on a plain background.
+5. **Stereo** (`process`): pairs tried (CNN pairs first) with row tolerance EPIPOLAR_TOL_PX 20, disparity range,
+   left/right size ratio; fine disparity along the measured row offset (silhouette for blobs, grey SAD for
+   circles), falls back to centre disparity ("ok_centroid"); **physical size check** vs the stereo depth.
+6. Kalman (constant velocity); **CONFIRM_FRAMES 2** consecutive consistent detections before `detected` is sent.
+7. Previews: `--preview HOST` -> live_view (5008); `SIM_FEED` -> sim (5009, 8 fps, half res).
+- Focal length: `--calibrate-f DIST` (ball still, centred, DIST m lens->ball centre) writes calib.json.
+  Our webcam: f ~ 470-530 px at 320x240 (default 246 assumed a 66 deg lens: distances came out ~2x short).
+
+## QNX 8.0 camera findings (verified on the Pi 5) - do not relearn these
+- **Python ctypes callbacks segfault** (even `qsort` with a Python callback, even as root): never call libcamapi
+  with callbacks from Python. The C bridge `qnx/stereo_capture.c` does it; build ON the Pi with
+  `clang -O2 -o stereo_capture qnx/stereo_capture.c -lcamapi`. The camera API is declared in the .c (no SDK header).
+- `CAMERA_UNIT_n` == n (0 = none). `camera_get_supported_cameras` returns sensor unit numbers.
+- A ycbycr USB stream reports `camera_frametype_t` **14** -> stereo_capture trusts the configured format (`-f`).
+- `camera_buffer_t` layout differs from the 7.1 docs: {height, width, stride} at **+72** (docs +48); the pixel
+  pointer is at +16, timestamp (CLOCK_MONOTONIC us) at +40. stereo_capture finds the size fields by value, checks
+  the pointer with a `pipe()` write (EFAULT-safe), and dumps the header on the first frame.
+- Sensor service: the boot instance (sensor_rpi5.conf) fails without ribbon cameras and serves nothing ("Another
+  instance of SensorService is already running" if not slayed). Start ours WITHOUT `-b external`
+  (`sensor -U 521:521 -r /data/share/sensor -c <conf>`; `-b external` needs the Pi platform library line).
+  The `sensor` process may not show in `pidin ar | grep`; success = `/dev/sensor/camera1` exists.
+- USB device numbers are 2 on the Pi 5 (log `Adding device(046d:0825) bus B devno D`), not the hub's 1.
+- Webcams: Logitech 046d:0825, 640x480 YUYV, ~15 fps each (indoor light).
+- `on -C` on QNX 8.0 selects a CPU **cluster** (Pi 5: only 0); `-C 1 -C 2 -C 3` -> "Invalid cluster runmask" and
+  the process dies. Supervisor uses `on -p` only (`PIN_CPUS = False`).
 
 ## Supervisor (supervisor.py)
-- Launches with QNX `on` when present: control `on -p 40 -C 0`, perception `on -p 15 -C 1 -C 2 -C 3`.
-- Restarts on CRASH (process exited) or HANG (no heartbeat 0.5 s control / 1.5 s perception, after a
-  startup grace of 5 s / 30 s). Kills hung processes with SIGKILL (works on stopped processes).
-- Sends status from a separate UNBOUND socket (a socket bound to 127.0.0.1 cannot reach the laptop).
+Launch order control (40) -> capture (20, `-n 1 -u 1` in mono) -> perception (15). CRASH = exited; HANG = no
+heartbeat 0.5 s control / 1.5 s perception (after grace 5 s / 30 s) -> SIGKILL + restart. Capture has no
+heartbeat (crash detection only; perception detects a stalled camera). Processes failing within 3 s of start
+restart with back-off 1, 2, 4, 5 s. Status sent from a separate UNBOUND socket.
+
+## Simulator (sim3d.py)
+- Views: 1 chase, 2 top (dodge zone), 3 onboard, **4 camera's eye (default)**. Keys: C feed, M mock ball,
+  S stuck valve, F drain prop, R reset, ESC.
+- Asteroid drawn only from fresh tracks, **display-smoothed** (AST_SMOOTH_S 0.15, hold 0.5 s, snap > 75 m).
+- Encounters logged `[sim3d] encounter over: closest approach ...`; hit = < COLLISION_DIST.
+- **Auto reset**: after a dodge, when the ball reaches AUTO_RESET_BALL_Z (12 cm) the pass is recorded and the
+  asteroid hidden (REWIND); when the satellite is home in STATION_KEEP for 1 s -> reset (propellant, faults,
+  reset_id++). REWIND ends when the ball is back beyond 50 cm or unseen 1.5 s.
+- HUD shows `BALL x.xx m from camera`, Pi loop stats, procs, encounters/hits/auto resets, Pi camera feed.
 
 ## How to run
-Laptop (start FIRST):
-    SIM_IP=<laptop-ip> PI_IP=<pi-ip> python3 sim3d.py
-Pi:
-    SIM_IP=<laptop-ip> python3 supervisor.py --source synthetic   # later: --source qnx
-Single machine test (everything on the laptop): `python3 sim3d.py` and `python3 supervisor.py`.
-Simulator keys: 1 chase, 2 side, 3 onboard camera, M mock ball (no Pi perception needed),
-S stuck valve +z:A, F drain propellant, R reset, ESC quit.
-Fault demos on the Pi: `kill -9 <perception pid>` (crash), `kill -STOP <control pid>` (hang);
-the supervisor prints the PIDs.
+See README.md section 5 and RUN.md. Pi: `sudo sh qnx/start_cameras.sh qnx/sensor_dodge_mono.conf` after boot;
+laptop `SIM_IP=... PI_IP=... python sim3d.py` first; Pi `SIM_IP=<laptop> python3 supervisor.py --source qnx`.
+Laptop-only test: `python sim3d.py` + `python supervisor.py --source synthetic`.
 
 ## Testing rules for Claude Code
-- After any change, run an end-to-end test before saying it works. Headless Panda3D test:
-  `loadPrcFileData("", "load-display p3tinydisplay\nwindow-type offscreen\nframebuffer-multisample 0\nmultisamples 0\nsync-video 0")`
-  after importing `sim3d` and before creating `Sim3D()`; save screenshots with `app.win.saveScreenshot(Filename(...))`.
-  p3tinydisplay requires power-of-two textures (the disparity texture is 128x64 for this reason).
-- Success criteria: 0 hits over 5+ encounters, `[sim3d] encounter over` lines show closest approach
-  >> COLLISION_DIST (4 m), no Python tracebacks in the supervisor log, crash/hang/stuck-valve recover.
-- Known past bugs (do not reintroduce): numpy float32 in `json.dumps` crashed perception (use `default=float`);
-  dodging along-track let the satellite "outrun" the ball (only sideways candidates now); isolating a
-  valve without a backup branch made the satellite drift away.
+- After any change run an end-to-end test before saying it works. Headless Panda3D: after importing `sim3d`,
+  `loadPrcFileData("", "load-display p3tinydisplay\nwindow-type offscreen\nframebuffer-multisample 0\nmultisamples 0\nsync-video 0")`,
+  then `Sim3D()`, start `supervisor.py --source synthetic` as a subprocess, step `taskMgr.step()` for ~80 s,
+  save screenshots with `app.win.saveScreenshot(Filename(...))`. p3tinydisplay needs power-of-two textures.
+  Use other ports (config.SIM_PORT etc.) if the user's own sim is running.
+- Closed-loop controller test (no network): `sim3d.Physics` + `control.Controller` with `poll`/`asteroid`
+  monkeypatched; ball path 70 -> 10 cm through the slot at hand speeds 0.10-0.30 m/s, noisy track
+  (2 mm, 1.5 cm/s), 6 lateral offsets. Current: 0 hits 0.10-0.20 m/s, marginal 0.25, hits 0.30 (physics limit).
+- Success criteria: 0 hits over 5+ dodge passes, no tracebacks in the supervisor log, FDIR only isolates the
+  injected stuck valve, crash/hang recover, auto reset after each pass.
+- Known past bugs (do not reintroduce): numpy float32 in json.dumps (use default=float); dodging along-track;
+  isolating a valve without backup; dodge sized from a noisy predicted miss (use the min-max robust plan);
+  bang-bang chatter at high TIME_SCALE (tick-scaled deadbands, below REACHED_VEL); FDIR false isolations from
+  sim clock hiccups (rate guard); live_view starving its window on a continuous stream (drain <= 40 ms);
+  shape fallback accepting dark poster corners (needs `isolated`); counting the ball pulled back through the
+  satellite as a hit (REWIND).
+- Tool gotchas on this machine: Bash heredocs turn `\n` inside Python string literals into real newlines - write
+  edit scripts with the Write tool; re-Read a file before Edit if anything else modified it.
 
 ## Coding conventions
-- Pi code: numpy + tflite_runtime + stdlib only. Keep it compatible with the QNX Python 3 version
-  (check `python3 --version` on the Pi; avoid very new syntax).
-- `config.py` must stay identical on both machines; put new constants there, never hard-code.
-- Safety first: any new failure path must end in a defined safe state (valves closed, track dropped,
-  dodge held). Keep perception unable to block control.
-- Don't claim timing numbers measured on the laptop as QNX results; measure on the Pi.
-- Prefer small, testable changes; keep the message schema table in this file up to date.
+- Pi code: numpy + tflite_runtime + stdlib (+ the C bridge). `config.py` identical on both machines; put new
+  constants there. Safety first: every new failure path ends in a defined safe state.
+- Don't claim laptop timing numbers as QNX results; measure on the Pi (README has a table to fill in).
+- Keep the message table above up to date.
 
-## Current status (as of 2026-11-21)
-All files in the table exist and were tested on the LAPTOP only (Windows, Python 3.14, synthetic cameras).
-Nothing has run on the Pi/QNX yet, so there are no QNX timing numbers.
-- Perception: CNN int8 TFLite 99.7% on held-out synthetic patches (evaluated through the Pi code path);
-  stereo depth mean error ~2 mm over 9-60 cm (sub-mm laterally); ~3 ms/frame + 7 ms depth map; 30 fps.
-- Calibration self-test (`--synthetic 25`): recovered the 6.00 cm baseline as 6.01 cm, rms 0.37 px.
-- End-to-end (headless sim3d + supervisor + synthetic perception + CNN): 0 hits over 14 encounters;
-  perception crash (kill) -> restarted; control hang (process suspended) -> killed + restarted after 0.5 s;
-  stuck valve +z:A -> FDIR isolated +z:A, switched to B, later dodges clear. Mock ball (M): 5/5 clear.
-- Known limits: (1) propellant: each dodge + return costs ~0.17 kg, so 2 kg lasts ~12 encounters; press R
-  between demo runs (a stuck valve with an empty tank cannot be recovered: PROP_DEPLETED).
-  (2) with SPACE_SCALE 100 the tracked asteroid never gets closer than ~9.5 m to the slot (stereo minimum
-  range ~9 cm at DISP_MAX 170), so COLLISION_DIST 4 m is only reachable if the satellite moves toward it;
-  the encounter log therefore prints both the satellite distance and the asteroid-to-slot distance.
-  (3) FDIR cannot tell "+z stuck open" from "-z stuck closed" while -z fires; it blames the leak first and
-  the commanded valve if the same axis trips again. It never isolates a valve's last branch.
+## Current status (2026-11-22)
+- Working on real hardware: QNX sensor service + C bridge + mono USB camera (15 fps), perception on the Pi
+  (19.9 fps, CNN 1.2 ms, ~20 ms latency), focal calibration, sim with live camera feed. Ball: black 35 mm.
+- Tested on the laptop (synthetic camera): full system 12/12 passes clear (7.1-9.7 m), auto reset each pass,
+  stuck valve isolated, no false FDIR.
+- Not yet measured on the Pi: control-loop jitter/overruns (with and without CPU hogs) -> fill README table.
 
-## Next work (phases from the PRD)
-0. QNX bring-up: both cameras visible as sensor units 3 and 4; write the **stereo capture bridge**:
-   a small C program using the QNX camera library that opens units 3 and 4, grabs frames as close to
-   simultaneously as possible, converts to 320x240 RGB, and writes [t_capture, left, right] into shared
-   memory (`/dev/shmem/...`) with a sequence counter; then implement `QnxStereoSource.read()` in
-   perception.py to read it with `mmap` (numpy only). Build C with the QNX SDP on the laptop or the
-   self-hosted developer desktop on the Pi. See the QNX codelab on multiple camera sources on the Pi 5.
-1. Stereo rig (cameras 6 cm apart, parallel) + calibration (`--save-pairs`, `stereo_calibrate.py`).
-2. Retrain the CNN on real patches (`--save-patches data/ball`, `data/not_ball`).
-3. Full system on the Pi with `--source qnx`; 10 live passes, 0 hits, >= 20 fps.
-4. Real-time hardening: measure jitter on QNX; optional C port of control.py
-   (SCHED_FIFO, clock_nanosleep, QNX MsgSend/MsgReceive); optional GPIO LEDs per thruster.
-5. Demo and pitch: fault demos, backup video, rehearsals.
-Fallback if two cameras cannot stream together: one camera, depth from the ball's known size
-(Z = f * 0.04 / diameter_px).
+## Next work
+1. Measure QNX timing on the Pi (dashboard + `pidin`), incl. the 3x CPU-hog load test; fill README.
+2. Retrain the CNN on real black-ball patches (`--save-patches data/ball`, `data/not_ball`) to reduce reliance
+   on the shape fallback.
+3. Optional: C port of control.py (SCHED_FIFO, clock_nanosleep, QNX MsgSend/MsgReceive); QNX adaptive
+   partitioning to guarantee CPU budgets; GPIO LEDs per thruster; backup demo video.

@@ -74,9 +74,13 @@ def quat_error_vec(q):
 
 
 # --------------------------------------------------------------------------- frames
+SAT_BOARD = np.array([0.0, 0.0, config.SAT_BOARD_Z])
+
+
 def ball_to_space(p):
-    """Ball position (board frame, m) -> asteroid position (LVLH, m)."""
-    return config.SPACE_SCALE * (CAM_TO_LVLH @ np.asarray(p, dtype=float))
+    """Ball position (board frame, m) -> asteroid position (LVLH, m) relative to the satellite's slot,
+    which sits SAT_BOARD_Z in front of the camera."""
+    return config.SPACE_SCALE * (CAM_TO_LVLH @ (np.asarray(p, dtype=float) - SAT_BOARD))
 
 
 def ball_vel_to_space(v):
@@ -100,15 +104,22 @@ def project(p, cam_x):
 
 
 def ball_in_view(p, margin_px=2.0):
-    """True if the whole ball is inside BOTH images and its disparity is in range."""
+    """True if the whole ball is inside the image(s): mono = the one camera at X=0; stereo = BOTH
+    cameras and the disparity in range."""
     p = np.asarray(p, dtype=float)
     if p[2] <= 0.02:
         return False
     r_px = config.FOCAL_PX * (config.BALL_DIAM_M / 2.0) / p[2]
-    disp = config.FOCAL_PX * config.BASELINE_M / p[2]
-    if not (config.DISP_MIN <= disp <= config.DISP_MAX):
-        return False
-    for cam_x in (-config.BASELINE_M / 2.0, config.BASELINE_M / 2.0):
+    if config.CAMERA_MODE == "mono":
+        cams = (0.0,)
+        if not (config.MONO_Z_MIN <= p[2] <= config.MONO_Z_MAX):
+            return False
+    else:
+        cams = (-config.BASELINE_M / 2.0, config.BASELINE_M / 2.0)
+        disp = config.FOCAL_PX * config.BASELINE_M / p[2]
+        if not (config.DISP_MIN <= disp <= config.DISP_MAX):
+            return False
+    for cam_x in cams:
         u, v = project(p, cam_x)
         if u - r_px < margin_px or u + r_px > config.IMG_W - margin_px:
             return False
@@ -139,21 +150,21 @@ class HandScenario:
     def _new_encounter(self):
         r = self.rng
         side = 1.0 if r.random() < 0.5 else -1.0
-        far = np.array([r.uniform(-0.05, 0.05), r.uniform(-0.03, 0.03), r.uniform(0.45, 0.55)])
-        near = np.array([r.uniform(-0.012, 0.012), r.uniform(-0.008, 0.008), r.uniform(0.10, 0.14)])
+        far = np.array([r.uniform(-0.03, 0.03), r.uniform(-0.02, 0.02), r.uniform(0.66, 0.72)])
+        near = np.array([r.uniform(-0.012, 0.012), r.uniform(-0.008, 0.008), r.uniform(0.09, 0.11)])  # pushed through the satellite (30 cm) to ~10 cm
         off_in = np.array([side * 0.75, far[1], far[2]])
         style = len(self.encounters) % 2          # 0: retreat back, 1: sideways exit
         segs = [(1.0, off_in, far)]               # enter from the side
         segs.append((0.8, far, far))              # hover
-        segs.append((r.uniform(2.2, 3.2), far, near))  # approach
-        segs.append((r.uniform(0.3, 0.7), near, near)) # hold close
+        segs.append((r.uniform(4.0, 5.0), far, near))  # approach: avg 0.12-0.15 m/s, peak ~0.2 m/s (ease in/out)
+        segs.append((r.uniform(2.5, 3.5), near, near)) # hold at the camera while the satellite flies home
         if style == 0:
             back = np.array([near[0], near[1], 0.5])
             segs.append((1.6, near, back))
             segs.append((1.0, back, back + np.array([-side * 0.8, 0.0, 0.0])))
             last = back + np.array([-side * 0.8, 0.0, 0.0])
         else:
-            out = np.array([-side * 0.25, near[1], 0.16])
+            out = np.array([-side * 0.30, near[1], 0.16])
             segs.append((0.8, near, out))
             last = out
         segs.append((r.uniform(3.5, 4.5), last, last))  # out of view

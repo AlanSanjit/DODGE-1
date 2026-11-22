@@ -4,3 +4,8 @@ data/
 pairs/
 calib.json
 rectify_maps.npz
+snapshot_*.png
+cam_*.ppm
+cam_*.png
+live_view.png
+sup_test.log
